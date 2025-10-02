@@ -39,4 +39,10 @@ char *get_driver_fifo_name(pid_t pid) {
   return fifo_name;
 }
 
+char *get_driver_response_fifo_name(pid_t pid) {
+  char *fifo_name = malloc(FIFO_NAME_SIZE);
+  snprintf(fifo_name, FIFO_NAME_SIZE, "/tmp/taxi_driver_response_%d", pid);
+  return fifo_name;
+}
+
 int is_process_alive(pid_t pid) { return kill(pid, 0) == 0; }

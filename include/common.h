@@ -24,16 +24,13 @@ typedef struct {
 } Command;
 
 typedef struct {
-  pid_t pid;
-  int status;
-  int task_timer;
-  time_t task_end_time;
-  char fifo_name[FIFO_NAME_SIZE];
-} DriverInfo;
+  char response[BUFFER_SIZE];
+} Response;
 
 int create_fifo(const char *fifo_name);
 int open_fifo(const char *fifo_name, int mode);
 char *get_driver_fifo_name(pid_t pid);
+char *get_driver_response_fifo_name(pid_t pid);
 int is_process_alive(pid_t pid);
 
 #endif

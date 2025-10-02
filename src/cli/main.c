@@ -14,8 +14,6 @@ void signal_handler(int sig) {
 }
 
 int main() {
-  driver_list_init(&drivers_list);
-
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
   atexit(cleanup_drivers);

@@ -1,11 +1,13 @@
 #ifndef CLI_H
 #define CLI_H
 
-#include "driver_list.h"
+#include <unistd.h>
 
-extern driver_list_t drivers_list;
+#define MAX_DRIVERS 100
 
-void remove_dead_drivers(void);
+extern pid_t drivers[MAX_DRIVERS];
+extern int drivers_count;
+
 void create_driver(void);
 void send_task(pid_t pid, int task_timer);
 void get_status(pid_t pid);

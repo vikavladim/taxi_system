@@ -4,32 +4,88 @@
 
 #include "common.h"
 
-driver_list_t drivers_list;
+pid_t drivers[MAX_DRIVERS];
+int drivers_count = 0;
 
-void remove_dead_drivers(void) {
-  driver_node_t *current = drivers_list.head;
-  driver_node_t *prev = NULL;
+typedef struct {
+  pid_t pid;
+  int fifo_fd;
+  int response_fd;
+} driver_connection_t;
 
-  while (current != NULL) {
-    driver_node_t *next = current->next;
+driver_connection_t connections[MAX_DRIVERS];
+int connections_count = 0;
 
-    if (!is_process_alive(current->info.pid)) {
-      printf("Driver %d is dead, removing...\n", current->info.pid);
-
-      if (prev == NULL) {
-        drivers_list.head = next;
-      } else {
-        prev->next = next;
-      }
-
-      unlink(current->info.fifo_name);
-      free(current);
-      drivers_list.count--;
-    } else {
-      prev = current;
+int get_connection_fd(pid_t pid, int *fifo_fd, int *response_fd) {
+  for (int i = 0; i < connections_count; i++) {
+    if (connections[i].pid == pid) {
+      *fifo_fd = connections[i].fifo_fd;
+      *response_fd = connections[i].response_fd;
+      return 1;
     }
+  }
+  return 0;
+}
 
-    current = next;
+int add_connection(pid_t pid, int fifo_fd, int response_fd) {
+  for (int i = 0; i < connections_count; i++) {
+    if (connections[i].pid == pid) {
+      close(connections[i].fifo_fd);
+      close(connections[i].response_fd);
+      connections[i].fifo_fd = fifo_fd;
+      connections[i].response_fd = response_fd;
+      return 1;
+    }
+  }
+
+  if (connections_count < MAX_DRIVERS) {
+    connections[connections_count].pid = pid;
+    connections[connections_count].fifo_fd = fifo_fd;
+    connections[connections_count].response_fd = response_fd;
+    connections_count++;
+    return 1;
+  }
+  return 0;
+}
+
+void close_connection(pid_t pid) {
+  for (int i = 0; i < connections_count; i++) {
+    if (connections[i].pid == pid) {
+      close(connections[i].fifo_fd);
+      close(connections[i].response_fd);
+      for (int j = i; j < connections_count - 1; j++) {
+        connections[j] = connections[j + 1];
+      }
+      connections_count--;
+      break;
+    }
+  }
+}
+
+void add_driver(pid_t pid) {
+  for (int i = 0; i < drivers_count; i++) {
+    if (drivers[i] == pid) {
+      return;
+    }
+  }
+
+  if (drivers_count < MAX_DRIVERS) {
+    drivers[drivers_count++] = pid;
+
+    char *fifo_name = get_driver_fifo_name(pid);
+    int fifo_fd = open_fifo(fifo_name, O_WRONLY);
+    free(fifo_name);
+
+    char *response_fifo_name = get_driver_response_fifo_name(pid);
+    int response_fd = open_fifo(response_fifo_name, O_RDONLY | O_NONBLOCK);
+    free(response_fifo_name);
+
+    if (fifo_fd >= 0 && response_fd >= 0) {
+      add_connection(pid, fifo_fd, response_fd);
+    } else {
+      if (fifo_fd >= 0) close(fifo_fd);
+      if (response_fd >= 0) close(response_fd);
+    }
   }
 }
 
@@ -43,53 +99,24 @@ void create_driver(void) {
     perror("execl failed");
     exit(1);
   } else if (pid > 0) {
-    driver_node_t *driver = driver_list_add(&drivers_list, pid);
-    if (driver != NULL) {
-      driver->info.status = 0;
-      driver->info.task_timer = 0;
-
-      if (create_fifo(driver->info.fifo_name) == 0) {
-        printf("Driver created with PID: %d\n", pid);
-      } else {
-        printf("Failed to create FIFO for driver %d\n", pid);
-        driver_list_remove(&drivers_list, pid);
-      }
+    char *fifo_name = get_driver_fifo_name(pid);
+    if (create_fifo(fifo_name) == 0) {
+      add_driver(pid);
+      printf("Driver created with PID: %d\n", pid);
     } else {
-      printf("Failed to add driver to list\n");
+      printf("Failed to create FIFO for driver %d\n", pid);
     }
+    free(fifo_name);
   } else {
     perror("fork failed");
   }
 }
 
 void send_task(pid_t pid, int task_timer) {
-  remove_dead_drivers();
+  int fifo_fd, response_fd;
 
-  driver_node_t *driver = driver_list_find(&drivers_list, pid);
-  if (driver == NULL) {
-    printf("Driver with PID %d not found\n", pid);
-    return;
-  }
-
-  if (driver->info.status == 1) {
-    int remaining = driver->info.task_end_time - time(NULL);
-    if (remaining > 0) {
-      printf("Busy %d\n", remaining);
-    } else {
-      driver->info.status = 0;
-      Command status_cmd = {CMD_GET_STATUS, 0};
-      int fifo_fd = open_fifo(driver->info.fifo_name, O_WRONLY | O_NONBLOCK);
-      if (fifo_fd >= 0) {
-        write(fifo_fd, &status_cmd, sizeof(status_cmd));
-        close(fifo_fd);
-      }
-    }
-    return;
-  }
-
-  int fifo_fd = open_fifo(driver->info.fifo_name, O_WRONLY | O_NONBLOCK);
-  if (fifo_fd < 0) {
-    printf("Failed to communicate with driver %d\n", pid);
+  if (!get_connection_fd(pid, &fifo_fd, &response_fd)) {
+    printf("Driver %d not available\n", pid);
     return;
   }
 
@@ -98,47 +125,127 @@ void send_task(pid_t pid, int task_timer) {
   struct pollfd pfd = {fifo_fd, POLLOUT, 0};
   if (poll(&pfd, 1, 1000) > 0 && (pfd.revents & POLLOUT)) {
     if (write(fifo_fd, &cmd, sizeof(cmd)) == sizeof(cmd)) {
-      driver->info.status = 1;
-      driver->info.task_timer = task_timer;
-      driver->info.task_end_time = time(NULL) + task_timer;
       printf("Task sent to driver %d for %d seconds\n", pid, task_timer);
+
+      Response response;
+      struct pollfd response_pfd = {response_fd, POLLIN, 0};
+      if (poll(&response_pfd, 1, 1000) > 0 && (response_pfd.revents & POLLIN)) {
+        if (read(response_fd, &response, sizeof(response)) > 0) {
+          printf("Driver %d: %s", pid, response.response);
+        }
+      }
     } else {
       printf("Failed to send task to driver %d\n", pid);
     }
   } else {
     printf("Driver %d not responding\n", pid);
   }
-
-  close(fifo_fd);
 }
 
 void get_status(pid_t pid) {
-  remove_dead_drivers();
+  int fifo_fd, response_fd;
 
-  driver_node_t *driver = driver_list_find(&drivers_list, pid);
-  if (driver == NULL) {
-    printf("Driver with PID %d not found\n", pid);
+  if (!get_connection_fd(pid, &fifo_fd, &response_fd)) {
+    printf("Driver %d not available\n", pid);
     return;
   }
 
-  if (driver->info.status == 1) {
-    time_t current_time = time(NULL);
-    if (current_time >= driver->info.task_end_time) {
-      driver->info.status = 0;
-      driver->info.task_timer = 0;
-      printf("Available\n");
+  Command cmd = {CMD_GET_STATUS, 0};
+
+  struct pollfd pfd = {fifo_fd, POLLOUT, 0};
+  if (poll(&pfd, 1, 1000) > 0 && (pfd.revents & POLLOUT)) {
+    if (write(fifo_fd, &cmd, sizeof(cmd)) == sizeof(cmd)) {
+      Response response;
+      struct pollfd response_pfd = {response_fd, POLLIN, 0};
+      if (poll(&response_pfd, 1, 1000) > 0 && (response_pfd.revents & POLLIN)) {
+        if (read(response_fd, &response, sizeof(response)) > 0) {
+          printf("Driver %d: %s", pid, response.response);
+        }
+      }
     } else {
-      int remaining = driver->info.task_end_time - current_time;
-      printf("Busy %d\n", remaining);
+      printf("Failed to get status from driver %d\n", pid);
     }
   } else {
-    printf("Available\n");
+    printf("Driver %d not responding\n", pid);
   }
 }
 
 void get_drivers(void) {
-  remove_dead_drivers();
-  driver_list_print(&drivers_list);
+  printf("PID\t\tStatus\t\tRemaining Time\n");
+  printf("--------------------------------------------\n");
+
+  int active_count = 0;
+
+  for (int i = 0; i < drivers_count; i++) {
+    pid_t pid = drivers[i];
+    int fifo_fd, response_fd;
+
+    if (!get_connection_fd(pid, &fifo_fd, &response_fd)) {
+      printf("%d\t\tUnavailable\t-\n", pid);
+      continue;
+    }
+
+    Command cmd = {CMD_GET_STATUS, 0};
+
+    struct pollfd pfd = {fifo_fd, POLLOUT, 0};
+    if (poll(&pfd, 1, 500) > 0 && (pfd.revents & POLLOUT)) {
+      if (write(fifo_fd, &cmd, sizeof(cmd)) == sizeof(cmd)) {
+        Response response;
+        struct pollfd response_pfd = {response_fd, POLLIN, 0};
+
+        if (poll(&response_pfd, 1, 500) > 0 &&
+            (response_pfd.revents & POLLIN)) {
+          if (read(response_fd, &response, sizeof(response)) > 0) {
+            response.response[strcspn(response.response, "\n")] = 0;
+
+            if (strncmp(response.response, "Busy", 4) == 0) {
+              char *time_str = response.response + 5;
+              printf("%d\t\tBusy\t\t%s seconds\n", pid, time_str);
+            } else {
+              printf("%d\t\tAvailable\t-\n", pid);
+            }
+            active_count++;
+          }
+        } else {
+          printf("%d\t\tNo response\t-\n", pid);
+        }
+      } else {
+        printf("%d\t\tWrite error\t-\n", pid);
+      }
+    } else {
+      printf("%d\t\tNot responding\t-\n", pid);
+    }
+  }
+
+  if (active_count == 0 && drivers_count > 0) {
+    printf("No active drivers responding\n");
+  } else if (drivers_count == 0) {
+    printf("No drivers created\n");
+  }
 }
 
-void cleanup_drivers(void) { driver_list_clear(&drivers_list); }
+void cleanup_drivers(void) {
+  for (int i = 0; i < drivers_count; i++) {
+    if (is_process_alive(drivers[i])) {
+      int fifo_fd, response_fd;
+      if (get_connection_fd(drivers[i], &fifo_fd, &response_fd)) {
+        Command cmd = {CMD_EXIT, 0};
+        write(fifo_fd, &cmd, sizeof(cmd));
+        usleep(100000);
+      }
+      kill(drivers[i], SIGTERM);
+      waitpid(drivers[i], NULL, 0);
+    }
+
+    close_connection(drivers[i]);
+
+    char *fifo_name = get_driver_fifo_name(drivers[i]);
+    char *response_fifo_name = get_driver_response_fifo_name(drivers[i]);
+    unlink(fifo_name);
+    unlink(response_fifo_name);
+    free(fifo_name);
+    free(response_fifo_name);
+  }
+  drivers_count = 0;
+  connections_count = 0;
+}
